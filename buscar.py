@@ -14,11 +14,13 @@ from rapidfuzz import fuzz
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN")
 
-# De-para: número de WhatsApp do consultor -> usuário dele no Agendor.
-# Preencha com os consultores reais (poucos). A chave é só dígitos.
+# De-para: WhatsApp do consultor -> usuário dele no Agendor.
+# A âncora é o TELEFONE (fixo). O nome do responsável NÃO fica aqui — vem do
+# próprio Agendor junto dos candidatos, então sempre reflete quem está na carteira hoje.
+# A chave é só dígitos. O userId você pega na rota GET /users do Agendor.
 CONSULTORES = {
-    "5511999990000": {"userId": 70, "nome": "Marina Souza"},
-    # "55XXXXXXXXXXX": {"userId": 0, "nome": "..."},
+    "5511943800383": {"userId": 70},
+    # "55XXXXXXXXXXX": {"userId": 0},
 }
 
 # Cache da base de negócios (admin vê tudo; filtramos por consultor em memória).
@@ -117,6 +119,16 @@ def carteira_do_consultor(user_id):
     return [d for d in carregar_base() if user_id in set(_id_do_responsavel(d))]
 
 
+def _nome_responsavel(carteira, user_id):
+    """Pega o nome do responsável no próprio Agendor (não no de-para)."""
+    for d in carteira:
+        for chave in ("userOwner", "user"):
+            u = d.get(chave) or {}
+            if u.get("userId") == user_id and u.get("name"):
+                return u["name"]
+    return None
+
+
 def _campos_busca(deal):
     org = (deal.get("organization") or {}).get("name") or ""
     pes = (deal.get("person") or {}).get("name") or ""
@@ -156,11 +168,14 @@ def buscar(telefone, termo, limite=5, recente=False):
     carteira = carteira_do_consultor(consultor["userId"])
     termo_n = normalizar(termo)
 
+    # Nome do responsável vem do Agendor (o que reflete quem está na carteira hoje).
+    nome_resp = _nome_responsavel(carteira, consultor["userId"])
+
     # Sem termo: devolve os mais recentes da carteira.
     if not termo_n:
         recentes = sorted(carteira, key=lambda d: d.get("createTime") or "", reverse=True)
         cands = [_candidato(d, 0.0, i) for i, d in enumerate(recentes[:limite], 1)]
-        return {"status": "ok", "consultor": consultor["nome"], "total_carteira": len(carteira),
+        return {"status": "ok", "consultor": nome_resp, "total_carteira": len(carteira),
                 "candidatos": cands}, 200
 
     pontuados = []
@@ -177,7 +192,7 @@ def buscar(telefone, termo, limite=5, recente=False):
     pontuados.sort(key=lambda x: x[0], reverse=True)
     melhor = pontuados[0][0] if pontuados else 0
 
-    base = {"consultor": consultor["nome"], "total_carteira": len(carteira)}
+    base = {"consultor": nome_resp, "total_carteira": len(carteira)}
 
     # Nada chega nem perto: não localiza e não deixa gravar.
     if melhor < PISO_APROXIMADO:
