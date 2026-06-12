@@ -14,18 +14,22 @@ from rapidfuzz import fuzz
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN")
 
-# De-para: WhatsApp do consultor -> usuário dele no Agendor.
-# A âncora é o TELEFONE (fixo). O nome do responsável NÃO fica aqui — vem do
-# próprio Agendor junto dos candidatos, então sempre reflete quem está na carteira hoje.
-# A chave é só dígitos. O userId você pega na rota GET /users do Agendor.
+# De-para de consultores.
+# Por padrão o serviço descobre sozinho lendo os telefones cadastrados no Agendor
+# (campos WhatsApp, celular e telefone de cada usuário em GET /users). Ou seja: o
+# ajuste é feito direto no Agendor, sem mexer em código.
+# Use o dicionário abaixo só pra exceções/forçar um número específico -> userId.
 CONSULTORES = {
-    "5511943800383": {"userId": 70},
-    # "55XXXXXXXXXXX": {"userId": 0},
+    # "5511943800383": {"userId": 880789},  # ex.: número alternativo do Aristeu
 }
 
 # Cache da base de negócios (admin vê tudo; filtramos por consultor em memória).
 _CACHE = {"deals": None, "at": 0}
 _CACHE_TTL = 600  # 10 min
+
+# Cache do de-para telefone -> userId, lido dos cadastros do Agendor.
+_USERS_CACHE = {"map": None, "at": 0}
+_USERS_TTL = 600  # 10 min
 
 # Cortes de confiança do fuzzy (0-100).
 CORTE_LISTAR = 70       # >= aqui: match confiável, lista pra confirmar
@@ -38,6 +42,18 @@ _PREFIXOS = r"\b(condominio|condominial|cond|edificio|edif|ed|residencial|resid|
 
 def so_digitos(s):
     return re.sub(r"\D", "", s or "")
+
+
+def _tel_canon(s):
+    """
+    Padroniza telefone BR pra comparar: tira o DDI 55 da frente quando presente.
+    Só remove se o tamanho for de número completo com país (12 ou 13 dígitos),
+    pra não confundir com o DDD 55 (Santa Maria/RS), que tem 10-11 dígitos.
+    """
+    d = so_digitos(s)
+    if len(d) in (12, 13) and d.startswith("55"):
+        d = d[2:]
+    return d
 
 
 def normalizar(texto):
@@ -119,6 +135,42 @@ def carteira_do_consultor(user_id):
     return [d for d in carregar_base() if user_id in set(_id_do_responsavel(d))]
 
 
+def _mapa_telefones():
+    """
+    Monta {telefone(dígitos): userId} lendo os usuários do Agendor.
+    Considera WhatsApp, celular e telefone de cada um — assim o consultor é
+    reconhecido por qualquer um dos números que ele tenha cadastrado.
+    """
+    agora = time.time()
+    if _USERS_CACHE["map"] is not None and (agora - _USERS_CACHE["at"]) < _USERS_TTL:
+        return _USERS_CACHE["map"]
+
+    mapa = {}
+    r = _agendor_get("/users")
+    if r.ok:
+        for u in (r.json().get("data") or []):
+            uid = u.get("id")
+            contato = u.get("contact") or {}
+            for campo in ("whatsapp", "mobile", "work"):
+                tel = _tel_canon(contato.get(campo))
+                if uid and len(tel) >= 10:
+                    mapa[tel] = uid
+    _USERS_CACHE["map"] = mapa
+    _USERS_CACHE["at"] = agora
+    return mapa
+
+
+def _resolver_consultor(tel):
+    """Acha o userId do consultor: primeiro nas exceções, depois no Agendor."""
+    tel_c = _tel_canon(tel)
+    if tel in CONSULTORES:
+        return CONSULTORES[tel]
+    if tel_c in CONSULTORES:
+        return CONSULTORES[tel_c]
+    uid = _mapa_telefones().get(tel_c)
+    return {"userId": uid} if uid else None
+
+
 def _nome_responsavel(carteira, user_id):
     """Pega o nome do responsável no próprio Agendor (não no de-para)."""
     for d in carteira:
@@ -161,7 +213,7 @@ def _candidato(deal, score, opcao=None):
 def buscar(telefone, termo, limite=5, recente=False):
     """Retorna candidatos ranqueados dentro da carteira do consultor."""
     tel = so_digitos(telefone)
-    consultor = CONSULTORES.get(tel)
+    consultor = _resolver_consultor(tel)
     if not consultor:
         return {"erro": "consultor_nao_mapeado", "telefone": tel}, 422
 
