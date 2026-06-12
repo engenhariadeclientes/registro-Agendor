@@ -8,7 +8,6 @@ import os
 import re
 import time
 import unicodedata
-import threading
 import requests
 from rapidfuzz import fuzz
 
@@ -24,11 +23,9 @@ CONSULTORES = {
     # "5511943800383": {"userId": 880789},  # ex.: número alternativo do Aristeu
 }
 
-# Cache da base de negócios (admin vê tudo; filtramos por consultor em memória).
-# A carga roda em segundo plano pra nunca travar a requisição.
-_CACHE = {"deals": None, "at": 0, "loading": False}
-_CACHE_TTL = 1800  # 30 min
-_LOAD_LOCK = threading.Lock()
+# Cache por consultor: userId -> {deals, at}. Cada um carrega só a própria carteira.
+_CARTEIRA_CACHE = {}
+_CARTEIRA_TTL = 300  # 5 min
 
 # Cache do de-para telefone -> userId, lido dos cadastros do Agendor.
 _USERS_CACHE = {"map": None, "at": 0}
@@ -103,45 +100,8 @@ def _agendor_get(path, params=None, tentativa=0):
     return resp
 
 
-def _carregar_base_sync():
-    """Puxa todos os negócios (paginado). Roda em segundo plano, fora da requisição."""
-    deals, page = [], 1
-    while page <= 80:  # teto de segurança
-        r = _agendor_get("/deals", {"page": page, "per_page": 100})
-        if not r.ok:
-            break
-        lote = r.json().get("data") or []
-        if not lote:
-            break
-        deals.extend(lote)
-        if len(lote) < 100:
-            break
-        page += 1
-    _CACHE["deals"] = deals
-    _CACHE["at"] = time.time()
-    _CACHE["loading"] = False
-
-
-def _disparar_carga():
-    """Inicia a carga em segundo plano, sem deixar duas rodando ao mesmo tempo."""
-    with _LOAD_LOCK:
-        if _CACHE["loading"]:
-            return
-        _CACHE["loading"] = True
-    threading.Thread(target=_carregar_base_sync, daemon=True).start()
-
-
-def garantir_base():
-    """
-    Devolve a base em memória. Se ainda não carregou, dispara a carga em segundo
-    plano e devolve None (a requisição não espera). Se está velha, atualiza por
-    trás mas segue servindo o que tem.
-    """
-    deals = _CACHE["deals"]
-    velha = (time.time() - _CACHE["at"]) >= _CACHE_TTL
-    if deals is None or velha:
-        _disparar_carga()
-    return deals
+class FiltroNaoSuportado(Exception):
+    """A API ignorou o filtro por usuário (devolveu negócios de outras pessoas)."""
 
 
 def _id_do_responsavel(deal):
@@ -151,9 +111,40 @@ def _id_do_responsavel(deal):
             yield u["userId"]
 
 
+def _pertence(deal, user_id):
+    return user_id in set(_id_do_responsavel(deal))
+
+
 def carteira_do_consultor(user_id):
-    base = garantir_base() or []
-    return [d for d in base if user_id in set(_id_do_responsavel(d))]
+    """
+    Busca SÓ os negócios do consultor, pedindo o filtro por responsável direto na
+    API (rápido, dentro da requisição). Se a API ignorar o filtro (1ª página vem
+    com negócios de outras pessoas), levanta FiltroNaoSuportado em vez de travar.
+    """
+    cache = _CARTEIRA_CACHE.get(user_id)
+    if cache and (time.time() - cache["at"]) < _CARTEIRA_TTL:
+        return cache["deals"]
+
+    deals, page = [], 1
+    while page <= 20:  # uma carteira não tem milhares; teto de segurança
+        r = _agendor_get("/deals", {"userOwner": user_id, "page": page, "per_page": 100})
+        if not r.ok:
+            break
+        lote = r.json().get("data") or []
+        if not lote:
+            break
+        if page == 1:
+            casam = sum(1 for d in lote if _pertence(d, user_id))
+            # Se quase nada da 1ª página é do consultor, a API ignorou o filtro.
+            if casam == 0 or (len(lote) >= 100 and casam < len(lote) * 0.5):
+                raise FiltroNaoSuportado()
+        deals.extend([d for d in lote if _pertence(d, user_id)])
+        if len(lote) < 100:
+            break
+        page += 1
+
+    _CARTEIRA_CACHE[user_id] = {"deals": deals, "at": time.time()}
+    return deals
 
 
 def _mapa_telefones():
@@ -238,12 +229,12 @@ def buscar(telefone, termo, limite=5, recente=False):
     if not consultor:
         return {"erro": "consultor_nao_mapeado", "telefone": tel}, 422
 
-    # Base ainda carregando em segundo plano: responde rápido, sem travar.
-    if garantir_base() is None:
-        return {"status": "carregando",
-                "mensagem": "Base de negócios carregando, tente de novo em instantes."}, 503
-
-    carteira = carteira_do_consultor(consultor["userId"])
+    try:
+        carteira = carteira_do_consultor(consultor["userId"])
+    except FiltroNaoSuportado:
+        return {"status": "filtro_nao_suportado",
+                "mensagem": "A API do Agendor ignorou o filtro por responsável; "
+                            "precisamos ajustar o parâmetro da busca."}, 200
     termo_n = normalizar(termo)
 
     # Nome do responsável vem do Agendor (o que reflete quem está na carteira hoje).
