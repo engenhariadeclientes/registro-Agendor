@@ -105,43 +105,70 @@ class FiltroNaoSuportado(Exception):
 
 
 def _id_do_responsavel(deal):
-    for chave in ("userOwner", "user"):
+    # Campos reais da API: owner (responsável), author (criou), allowedUsers (acesso).
+    for chave in ("owner", "author"):
         u = deal.get(chave) or {}
-        if u.get("userId"):
-            yield u["userId"]
+        if u.get("id"):
+            yield u["id"]
+    for u in (deal.get("allowedUsers") or []):
+        if u.get("id"):
+            yield u["id"]
 
 
 def _pertence(deal, user_id):
     return user_id in set(_id_do_responsavel(deal))
 
 
+# Nomes de filtro candidatos (a API real usa 'owner' na saída; o de entrada varia).
+_PARAMS_FILTRO = ["userOwner", "user", "ownerUser", "owner"]
+
+
+def _pagina_filtrada(param, user_id, page):
+    r = _agendor_get("/deals", {param: user_id, "page": page, "per_page": 100})
+    if not r.ok:
+        return None
+    return r.json().get("data") or []
+
+
+def _descobrir_param(user_id):
+    """Acha qual parâmetro a API respeita pra filtrar por responsável."""
+    viu_sem_filtro = False
+    for p in _PARAMS_FILTRO:
+        lote = _pagina_filtrada(p, user_id, 1)
+        if lote is None or not lote:
+            continue  # erro ou vazio: tenta o próximo
+        casam = sum(1 for d in lote if _pertence(d, user_id))
+        if casam >= max(1, len(lote) * 0.5):
+            return p, lote  # esse filtrou de verdade
+        viu_sem_filtro = True  # veio cheio de gente que não é o consultor
+    if viu_sem_filtro:
+        raise FiltroNaoSuportado()
+    return None, []  # ninguém trouxe nada: consultor sem negócios
+
+
 def carteira_do_consultor(user_id):
     """
     Busca SÓ os negócios do consultor, pedindo o filtro por responsável direto na
-    API (rápido, dentro da requisição). Se a API ignorar o filtro (1ª página vem
-    com negócios de outras pessoas), levanta FiltroNaoSuportado em vez de travar.
+    API. Descobre o nome do parâmetro automaticamente. Se nenhum filtrar de fato,
+    levanta FiltroNaoSuportado em vez de baixar a base inteira e travar.
     """
     cache = _CARTEIRA_CACHE.get(user_id)
     if cache and (time.time() - cache["at"]) < _CARTEIRA_TTL:
         return cache["deals"]
 
-    deals, page = [], 1
-    while page <= 20:  # uma carteira não tem milhares; teto de segurança
-        r = _agendor_get("/deals", {"userOwner": user_id, "page": page, "per_page": 100})
-        if not r.ok:
-            break
-        lote = r.json().get("data") or []
-        if not lote:
-            break
-        if page == 1:
-            casam = sum(1 for d in lote if _pertence(d, user_id))
-            # Se quase nada da 1ª página é do consultor, a API ignorou o filtro.
-            if casam == 0 or (len(lote) >= 100 and casam < len(lote) * 0.5):
-                raise FiltroNaoSuportado()
-        deals.extend([d for d in lote if _pertence(d, user_id)])
-        if len(lote) < 100:
-            break
-        page += 1
+    param, primeira = _descobrir_param(user_id)
+    deals = [d for d in primeira if _pertence(d, user_id)]
+
+    if param and len(primeira) >= 100:  # tem mais páginas
+        page = 2
+        while page <= 20:
+            lote = _pagina_filtrada(param, user_id, page)
+            if not lote:
+                break
+            deals.extend([d for d in lote if _pertence(d, user_id)])
+            if len(lote) < 100:
+                break
+            page += 1
 
     _CARTEIRA_CACHE[user_id] = {"deals": deals, "at": time.time()}
     return deals
@@ -186,9 +213,9 @@ def _resolver_consultor(tel):
 def _nome_responsavel(carteira, user_id):
     """Pega o nome do responsável no próprio Agendor (não no de-para)."""
     for d in carteira:
-        for chave in ("userOwner", "user"):
+        for chave in ("owner", "author"):
             u = d.get(chave) or {}
-            if u.get("userId") == user_id and u.get("name"):
+            if u.get("id") == user_id and u.get("name"):
                 return u["name"]
     return None
 
@@ -205,12 +232,12 @@ def _candidato(deal, score, opcao=None):
     pes = deal.get("person") or {}
     etapa = (deal.get("dealStage") or {}).get("name")
     status = (deal.get("dealStatus") or {}).get("name")
-    entrada = (deal.get("createTime") or "")[:10]
+    entrada = (deal.get("createdAt") or "")[:10]
     c = {}
     if opcao is not None:
         c["opcao"] = opcao
     c.update({
-        "dealId": deal.get("dealId"),
+        "dealId": deal.get("id"),
         "condominio": org.get("name"),
         "contato": pes.get("name"),
         "titulo": deal.get("title"),
@@ -242,7 +269,7 @@ def buscar(telefone, termo, limite=5, recente=False):
 
     # Sem termo: devolve os mais recentes da carteira.
     if not termo_n:
-        recentes = sorted(carteira, key=lambda d: d.get("createTime") or "", reverse=True)
+        recentes = sorted(carteira, key=lambda d: d.get("createdAt") or "", reverse=True)
         cands = [_candidato(d, 0.0, i) for i, d in enumerate(recentes[:limite], 1)]
         return {"status": "ok", "consultor": nome_resp, "total_carteira": len(carteira),
                 "candidatos": cands}, 200
@@ -252,7 +279,7 @@ def buscar(telefone, termo, limite=5, recente=False):
         org, pes, tit = _campos_busca(d)
         alvos = [normalizar(x) for x in (org, tit, pes) if x]
         score = max((_pontuar(termo_n, a) for a in alvos), default=0)
-        if recente and (d.get("createTime") or "") >= time.strftime(
+        if recente and (d.get("createdAt") or "") >= time.strftime(
             "%Y-%m-%d", time.gmtime(time.time() - 3 * 86400)
         ):
             score = min(100, score + 8)  # leve empurrão pra entradas recentes
