@@ -8,6 +8,7 @@ import os
 import re
 import time
 import unicodedata
+import threading
 import requests
 from rapidfuzz import fuzz
 
@@ -24,8 +25,10 @@ CONSULTORES = {
 }
 
 # Cache da base de negócios (admin vê tudo; filtramos por consultor em memória).
-_CACHE = {"deals": None, "at": 0}
-_CACHE_TTL = 600  # 10 min
+# A carga roda em segundo plano pra nunca travar a requisição.
+_CACHE = {"deals": None, "at": 0, "loading": False}
+_CACHE_TTL = 1800  # 30 min
+_LOAD_LOCK = threading.Lock()
 
 # Cache do de-para telefone -> userId, lido dos cadastros do Agendor.
 _USERS_CACHE = {"map": None, "at": 0}
@@ -100,14 +103,10 @@ def _agendor_get(path, params=None, tentativa=0):
     return resp
 
 
-def carregar_base():
-    """Puxa todos os negócios (paginado) e guarda em cache por alguns minutos."""
-    agora = time.time()
-    if _CACHE["deals"] is not None and (agora - _CACHE["at"]) < _CACHE_TTL:
-        return _CACHE["deals"]
-
+def _carregar_base_sync():
+    """Puxa todos os negócios (paginado). Roda em segundo plano, fora da requisição."""
     deals, page = [], 1
-    while page <= 60:  # teto de segurança (~6000 negócios)
+    while page <= 80:  # teto de segurança
         r = _agendor_get("/deals", {"page": page, "per_page": 100})
         if not r.ok:
             break
@@ -118,9 +117,30 @@ def carregar_base():
         if len(lote) < 100:
             break
         page += 1
-
     _CACHE["deals"] = deals
-    _CACHE["at"] = agora
+    _CACHE["at"] = time.time()
+    _CACHE["loading"] = False
+
+
+def _disparar_carga():
+    """Inicia a carga em segundo plano, sem deixar duas rodando ao mesmo tempo."""
+    with _LOAD_LOCK:
+        if _CACHE["loading"]:
+            return
+        _CACHE["loading"] = True
+    threading.Thread(target=_carregar_base_sync, daemon=True).start()
+
+
+def garantir_base():
+    """
+    Devolve a base em memória. Se ainda não carregou, dispara a carga em segundo
+    plano e devolve None (a requisição não espera). Se está velha, atualiza por
+    trás mas segue servindo o que tem.
+    """
+    deals = _CACHE["deals"]
+    velha = (time.time() - _CACHE["at"]) >= _CACHE_TTL
+    if deals is None or velha:
+        _disparar_carga()
     return deals
 
 
@@ -132,7 +152,8 @@ def _id_do_responsavel(deal):
 
 
 def carteira_do_consultor(user_id):
-    return [d for d in carregar_base() if user_id in set(_id_do_responsavel(d))]
+    base = garantir_base() or []
+    return [d for d in base if user_id in set(_id_do_responsavel(d))]
 
 
 def _mapa_telefones():
@@ -216,6 +237,11 @@ def buscar(telefone, termo, limite=5, recente=False):
     consultor = _resolver_consultor(tel)
     if not consultor:
         return {"erro": "consultor_nao_mapeado", "telefone": tel}, 422
+
+    # Base ainda carregando em segundo plano: responde rápido, sem travar.
+    if garantir_base() is None:
+        return {"status": "carregando",
+                "mensagem": "Base de negócios carregando, tente de novo em instantes."}, 503
 
     carteira = carteira_do_consultor(consultor["userId"])
     termo_n = normalizar(termo)
